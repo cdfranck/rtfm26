@@ -52,6 +52,7 @@ public sealed class BlogStore
         {
             var posts = LoadInternal();
             var existing = posts.FindIndex(x => x.Id == post.Id);
+            post.Category = NormalizeCategory(post.Category);
             post.UpdatedUtc = DateTimeOffset.UtcNow;
 
             if (existing >= 0)
@@ -96,12 +97,23 @@ public sealed class BlogStore
             return [];
         }
 
-        return JsonSerializer.Deserialize<List<BlogPost>>(json, JsonOptions) ?? [];
+        var posts = JsonSerializer.Deserialize<List<BlogPost>>(json, JsonOptions) ?? [];
+        foreach (var post in posts)
+        {
+            post.Category = NormalizeCategory(post.Category);
+        }
+
+        return posts;
     }
 
     private void SaveInternal(List<BlogPost> posts)
     {
         var json = JsonSerializer.Serialize(posts, JsonOptions);
         File.WriteAllText(_path, json);
+    }
+
+    private static string NormalizeCategory(string? category)
+    {
+        return string.IsNullOrWhiteSpace(category) ? "default" : category.Trim();
     }
 }

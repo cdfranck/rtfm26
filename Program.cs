@@ -12,6 +12,7 @@ using rtfm26.Services;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<BlogStore>();
 builder.Services.AddSingleton<PageStore>();
+builder.Services.AddSingleton<SiteSettingsStore>();
 
 var adminEmail = builder.Configuration["Admin:AllowedEmail"] ?? string.Empty;
 var tenantId = builder.Configuration["Authentication:Microsoft:TenantId"] ?? string.Empty;
@@ -79,30 +80,66 @@ app.UseStaticFiles(new StaticFileOptions
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapGet("/", (HttpContext http, BlogStore blogStore, PageStore pageStore) =>
+app.MapGet("/", (HttpContext http, BlogStore blogStore, PageStore pageStore, SiteSettingsStore settingsStore) =>
 {
     var posts = blogStore.List();
     var pages = pageStore.List();
-    return Results.Content(RenderHome(posts, pages, IsAdminUser(http.User, adminEmail), GetUserEmail(http.User)), "text/html");
+    var navItems = settingsStore.GetNavigationItems();
+    var isAuthenticated = http.User.Identity?.IsAuthenticated ?? false;
+    return Results.Content(
+        RenderHome(
+            posts,
+            pages,
+            navItems,
+            isAuthenticated,
+            IsAdminUser(http.User, adminEmail),
+            GetUserEmail(http.User),
+            settingsStore.GetHomeRecentPostCount()),
+        "text/html");
 });
 
-app.MapGet("/post/{slug}", (string slug, BlogStore blogStore, PageStore pageStore) =>
+app.MapGet("/post/{slug}", (HttpContext http, string slug, BlogStore blogStore, PageStore pageStore, SiteSettingsStore settingsStore) =>
 {
     var post = blogStore.GetBySlug(slug);
     return post is null
         ? Results.NotFound("Post not found.")
-        : Results.Content(RenderPost(post, blogStore.List(), pageStore.List()), "text/html");
+        : Results.Content(
+            RenderPost(
+                post,
+                pageStore.List(),
+                settingsStore.GetNavigationItems(),
+                http.User.Identity?.IsAuthenticated ?? false,
+                IsAdminUser(http.User, adminEmail),
+                GetUserEmail(http.User)),
+            "text/html");
 });
 
-app.MapGet("/page/{slug}", (string slug, BlogStore blogStore, PageStore pageStore) =>
+app.MapGet("/page/{slug}", (HttpContext http, string slug, BlogStore blogStore, PageStore pageStore, SiteSettingsStore settingsStore) =>
 {
     var page = pageStore.GetBySlug(slug);
+    var allPosts = blogStore.List();
+    var matchingPosts = page is null
+        ? []
+        : allPosts
+            .Where(p => p.Category.Equals(page.Category, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(p => p.UpdatedUtc)
+            .ToList();
+
     return page is null
         ? Results.NotFound("Page not found.")
-        : Results.Content(RenderPage(page, blogStore.List(), pageStore.List()), "text/html");
+        : Results.Content(
+            RenderPage(
+                page,
+                matchingPosts,
+                pageStore.List(),
+                settingsStore.GetNavigationItems(),
+                http.User.Identity?.IsAuthenticated ?? false,
+                IsAdminUser(http.User, adminEmail),
+                GetUserEmail(http.User)),
+            "text/html");
 });
 
-app.MapGet("/admin", (HttpRequest request, BlogStore blogStore, PageStore pageStore) =>
+app.MapGet("/admin", (HttpContext http, HttpRequest request, BlogStore blogStore, PageStore pageStore, SiteSettingsStore settingsStore) =>
 {
     var posts = blogStore.List();
     var pages = pageStore.List();
@@ -126,7 +163,46 @@ app.MapGet("/admin", (HttpRequest request, BlogStore blogStore, PageStore pageSt
         importedCount = imported;
     }
 
-    return Results.Content(RenderAdmin(posts, pages, uploaded, editingPost, editingPage, importedCount), "text/html");
+    var navItems = settingsStore.GetNavigationItems();
+    var navEditorText = SerializeNavigationItemsForEditor(navItems);
+
+    return Results.Content(
+        RenderAdmin(
+            posts,
+            pages,
+            navItems,
+            navEditorText,
+            uploaded,
+            editingPost,
+            editingPage,
+            importedCount,
+            settingsStore.GetHomeRecentPostCount(),
+            http.User.Identity?.IsAuthenticated ?? false,
+            IsAdminUser(http.User, adminEmail),
+            GetUserEmail(http.User)),
+        "text/html");
+}).RequireAuthorization("AdminOnly");
+
+app.MapPost("/admin/settings/navigation", async (HttpRequest request, SiteSettingsStore settingsStore) =>
+{
+    var form = await request.ReadFormAsync();
+    var text = form["navigationItems"].ToString();
+    var items = ParseNavigationItemsFromEditor(text);
+    settingsStore.SetNavigationItems(items);
+    return Results.Redirect("/admin");
+}).RequireAuthorization("AdminOnly");
+
+app.MapPost("/admin/settings/home", async (HttpRequest request, SiteSettingsStore settingsStore) =>
+{
+    var form = await request.ReadFormAsync();
+    var input = form["homeRecentPostCount"].ToString().Trim();
+    if (!int.TryParse(input, out var count))
+    {
+        return Results.BadRequest("Invalid post count.");
+    }
+
+    settingsStore.SetHomeRecentPostCount(count);
+    return Results.Redirect("/admin");
 }).RequireAuthorization("AdminOnly");
 
 app.MapPost("/admin/save", async (HttpRequest request, BlogStore blogStore) =>
@@ -135,6 +211,7 @@ app.MapPost("/admin/save", async (HttpRequest request, BlogStore blogStore) =>
 
     var title = form["title"].ToString().Trim();
     var slug = Slugify(form["slug"].ToString().Trim());
+    var category = NormalizeCategory(form["category"].ToString());
     var content = form["content"].ToString().Trim();
     var idText = form["id"].ToString().Trim();
 
@@ -151,6 +228,7 @@ app.MapPost("/admin/save", async (HttpRequest request, BlogStore blogStore) =>
     var post = blogStore.GetById(id) ?? new BlogPost { Id = id };
     post.Title = title;
     post.Slug = slug;
+    post.Category = category;
     post.Content = content;
     blogStore.Save(post);
 
@@ -168,13 +246,15 @@ app.MapPost("/admin/page/save", async (HttpRequest request, PageStore pageStore)
     var form = await request.ReadFormAsync();
 
     var title = form["title"].ToString().Trim();
-    var slug = Slugify(form["slug"].ToString().Trim());
+    var slugInput = form["slug"].ToString().Trim();
+    var slug = string.IsNullOrWhiteSpace(slugInput) ? string.Empty : Slugify(slugInput);
+    var category = NormalizeCategory(form["category"].ToString());
     var content = form["content"].ToString().Trim();
     var idText = form["id"].ToString().Trim();
 
-    if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(slug) || string.IsNullOrWhiteSpace(content))
+    if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(content))
     {
-        return Results.BadRequest("Title, slug, and content are required.");
+        return Results.BadRequest("Title and content are required.");
     }
 
     if (!Guid.TryParse(idText, out var id))
@@ -185,6 +265,7 @@ app.MapPost("/admin/page/save", async (HttpRequest request, PageStore pageStore)
     var page = pageStore.GetById(id) ?? new SitePage { Id = id };
     page.Title = title;
     page.Slug = slug;
+    page.Category = category;
     page.Content = content;
     pageStore.Save(page);
 
@@ -280,6 +361,7 @@ app.MapPost("/admin/import/posts-csv", async (HttpRequest request, BlogStore blo
     var header = rows[0].Select(h => h.Trim()).ToList();
     var titleIndex = header.FindIndex(h => h.Equals("title", StringComparison.OrdinalIgnoreCase));
     var slugIndex = header.FindIndex(h => h.Equals("slug", StringComparison.OrdinalIgnoreCase));
+    var categoryIndex = header.FindIndex(h => h.Equals("category", StringComparison.OrdinalIgnoreCase));
     var contentIndex = header.FindIndex(h => h.Equals("content", StringComparison.OrdinalIgnoreCase));
 
     if (titleIndex < 0 || contentIndex < 0)
@@ -298,6 +380,7 @@ app.MapPost("/admin/import/posts-csv", async (HttpRequest request, BlogStore blo
 
         var title = GetCsvValue(row, titleIndex).Trim();
         var slug = slugIndex >= 0 ? Slugify(GetCsvValue(row, slugIndex).Trim()) : string.Empty;
+        var category = categoryIndex >= 0 ? NormalizeCategory(GetCsvValue(row, categoryIndex)) : "default";
         var content = GetCsvValue(row, contentIndex).Trim();
 
         if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(content))
@@ -314,6 +397,7 @@ app.MapPost("/admin/import/posts-csv", async (HttpRequest request, BlogStore blo
         var post = existing ?? new BlogPost();
         post.Title = title;
         post.Slug = slug;
+        post.Category = category;
         post.Content = content;
         blogStore.Save(post);
         imported++;
@@ -322,9 +406,16 @@ app.MapPost("/admin/import/posts-csv", async (HttpRequest request, BlogStore blo
     return Results.Redirect($"/admin?imported={imported}");
 }).RequireAuthorization("AdminOnly");
 
-app.MapGet("/contact", (BlogStore blogStore, PageStore pageStore) =>
+app.MapGet("/contact", (HttpContext http, BlogStore blogStore, PageStore pageStore, SiteSettingsStore settingsStore) =>
 {
-    return Results.Content(RenderContact(blogStore.List(), pageStore.List()), "text/html");
+    return Results.Content(
+        RenderContact(
+            pageStore.List(),
+            settingsStore.GetNavigationItems(),
+            http.User.Identity?.IsAuthenticated ?? false,
+            IsAdminUser(http.User, adminEmail),
+            GetUserEmail(http.User)),
+        "text/html");
 });
 
 app.MapGet("/login", (HttpContext http) =>
@@ -367,21 +458,23 @@ app.MapGet("/error", () => Results.Problem("An unexpected error occurred."));
 
 app.Run();
 
-static string RenderHome(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages, bool isAdmin, string userEmail)
+static string RenderHome(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages, IReadOnlyList<SiteSettingsStore.NavigationItem> customNavItems, bool isAuthenticated, bool isAdmin, string userEmail, int homeRecentPostCount)
 {
-    var items = string.Join(Environment.NewLine, posts.Select(p =>
-        $"<li><a href=\"/post/{WebUtility.HtmlEncode(p.Slug)}\">{WebUtility.HtmlEncode(p.Title)}</a><small>{p.UpdatedUtc:yyyy-MM-dd}</small></li>"));
-    var content = posts.Count == 0 ? "<p>No posts yet. Use the editor to write the first post.</p>" : $"<ul>{items}</ul>";
-    var authSection = isAdmin
-        ? $$"""
-<div>
-  <p>Signed in as <strong>{{WebUtility.HtmlEncode(userEmail)}}</strong>.</p>
-  <p><a href="/admin">Open editor</a></p>
-  <form method="post" action="/logout"><button type="submit">Sign out</button></form>
-</div>
-"""
-        : "<p><a href=\"/login?returnUrl=/admin\">Sign in to edit</a></p>";
-
+    var embeddedPages = pages.Where(p => string.IsNullOrWhiteSpace(p.Slug)).ToList();
+    var recentPosts = posts.Take(homeRecentPostCount).ToList();
+    var items = string.Join(Environment.NewLine, recentPosts.Select(p =>
+        $"<li><a href=\"/post/{WebUtility.HtmlEncode(p.Slug)}\">{WebUtility.HtmlEncode(p.Title)}</a><small>{FormatCentralTime(p.UpdatedUtc)}</small></li>"));
+    var postsContent = recentPosts.Count == 0
+        ? "<p>No posts yet. Use the editor to write the first post.</p>"
+        : $"<p><small>Showing latest {recentPosts.Count} post(s).</small></p><ul>{items}</ul>";
+    var embeddedContent = string.Join(Environment.NewLine, embeddedPages.Select(p =>
+        $$"""
+<section style="margin-top:2rem;">
+  <h2>{{WebUtility.HtmlEncode(p.Title)}}</h2>
+  <div>{{RenderMarkup(p.Content)}}</div>
+</section>
+"""));
+    var content = postsContent + embeddedContent;
     return $$"""
 <!doctype html>
 <html lang="en">
@@ -406,8 +499,7 @@ static string RenderHome(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> 
   <main>
     <div class="hero"></div>
     <h1>Read the F*****g Manual!</h1>
-    {{RenderMenuBar(posts, pages)}}
-    {{authSection}}
+    {{RenderMenuBar(pages, customNavItems, isAuthenticated, isAdmin, userEmail)}}
     {{content}}
   </main>
 </body>
@@ -415,7 +507,7 @@ static string RenderHome(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> 
 """;
 }
 
-static string RenderPost(BlogPost post, IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages)
+static string RenderPost(BlogPost post, IReadOnlyList<SitePage> pages, IReadOnlyList<SiteSettingsStore.NavigationItem> customNavItems, bool isAuthenticated, bool isAdmin, string userEmail)
 {
     var title = WebUtility.HtmlEncode(post.Title);
     var body = RenderMarkup(post.Content);
@@ -436,9 +528,10 @@ static string RenderPost(BlogPost post, IReadOnlyList<BlogPost> posts, IReadOnly
 </head>
 <body>
   <main>
-    {{RenderMenuBar(posts, pages)}}
+    {{RenderMenuBar(pages, customNavItems, isAuthenticated, isAdmin, userEmail)}}
     <h1>{{title}}</h1>
-    <p><small>Updated {{post.UpdatedUtc:yyyy-MM-dd HH:mm}} UTC</small></p>
+    <p><small>Category: {{WebUtility.HtmlEncode(post.Category)}}</small></p>
+    <p><small>Updated {{FormatCentralTime(post.UpdatedUtc)}}</small></p>
     <article>{{body}}</article>
   </main>
 </body>
@@ -446,10 +539,14 @@ static string RenderPost(BlogPost post, IReadOnlyList<BlogPost> posts, IReadOnly
 """;
 }
 
-static string RenderPage(SitePage page, IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages)
+static string RenderPage(SitePage page, IReadOnlyList<BlogPost> matchingPosts, IReadOnlyList<SitePage> pages, IReadOnlyList<SiteSettingsStore.NavigationItem> customNavItems, bool isAuthenticated, bool isAdmin, string userEmail)
 {
     var title = WebUtility.HtmlEncode(page.Title);
     var body = RenderMarkup(page.Content);
+    var postItems = matchingPosts.Count == 0
+        ? "<p><small>No posts in this category yet.</small></p>"
+        : "<ul>" + string.Join(Environment.NewLine, matchingPosts.Select(p =>
+            $"<li><a href=\"/post/{WebUtility.HtmlEncode(p.Slug)}\">{WebUtility.HtmlEncode(p.Title)}</a> <small>{FormatCentralTime(p.UpdatedUtc)}</small></li>")) + "</ul>";
 
     return $$"""
 <!doctype html>
@@ -463,35 +560,41 @@ static string RenderPage(SitePage page, IReadOnlyList<BlogPost> posts, IReadOnly
     main { max-width: 960px; margin: 2rem auto; background: white; padding: 2rem; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.08); line-height: 1.6; }
     .menu { display: flex; gap: 0.8rem; flex-wrap: wrap; padding: 0.75rem; background: #f1f5f9; border-radius: 8px; margin-bottom: 1rem; }
     .menu a { color: #1d4ed8; text-decoration: none; font-weight: 600; }
+    ul { list-style: none; padding: 0; }
+    li { margin: 0.6rem 0; }
   </style>
 </head>
 <body>
   <main>
-    {{RenderMenuBar(posts, pages)}}
+    {{RenderMenuBar(pages, customNavItems, isAuthenticated, isAdmin, userEmail)}}
     <h1>{{title}}</h1>
-    <p><small>Updated {{page.UpdatedUtc:yyyy-MM-dd HH:mm}} UTC</small></p>
+    <p><small>Category: {{WebUtility.HtmlEncode(page.Category)}}</small></p>
+    <p><small>Updated {{FormatCentralTime(page.UpdatedUtc)}}</small></p>
     <article>{{body}}</article>
+    <h2>Posts in {{WebUtility.HtmlEncode(page.Category)}}</h2>
+    {{postItems}}
   </main>
 </body>
 </html>
 """;
 }
 
-static string RenderAdmin(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages, string uploadedPath, BlogPost? editingPost, SitePage? editingPage, int? importedCount)
+static string RenderAdmin(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages, IReadOnlyList<SiteSettingsStore.NavigationItem> customNavItems, string navEditorText, string uploadedPath, BlogPost? editingPost, SitePage? editingPage, int? importedCount, int homeRecentPostCount, bool isAuthenticated, bool isAdmin, string userEmail)
 {
     var postList = string.Join(Environment.NewLine, posts.Select(p =>
-        $$"""<li><strong>{{WebUtility.HtmlEncode(p.Title)}}</strong> <a href="/admin?editPost={{p.Id}}">edit</a> <a href="/post/{{WebUtility.HtmlEncode(p.Slug)}}">view</a> <form method="post" action="/admin/delete/{{p.Id}}" style="display:inline;"><button type="submit">delete</button></form></li>"""));
+        $$"""<li><strong>{{WebUtility.HtmlEncode(p.Title)}}</strong> <small>({{WebUtility.HtmlEncode(p.Category)}})</small> <a href="/admin?editPost={{p.Id}}">edit</a> <a href="/post/{{WebUtility.HtmlEncode(p.Slug)}}">view</a> <form method="post" action="/admin/delete/{{p.Id}}" style="display:inline;"><button type="submit">delete</button></form></li>"""));
     var pageList = string.Join(Environment.NewLine, pages.Select(p =>
-        $$"""<li><strong>{{WebUtility.HtmlEncode(p.Title)}}</strong> <a href="/admin?editPage={{p.Id}}">edit</a> <a href="/page/{{WebUtility.HtmlEncode(p.Slug)}}">view</a> <form method="post" action="/admin/page/delete/{{p.Id}}" style="display:inline;"><button type="submit">delete</button></form></li>"""));
+        $$"""<li><strong>{{WebUtility.HtmlEncode(p.Title)}}</strong> <small>({{WebUtility.HtmlEncode(p.Category)}})</small> <a href="/admin?editPage={{p.Id}}">edit</a> {{(string.IsNullOrWhiteSpace(p.Slug) ? "<small>embedded on home</small>" : $"<a href=\"/page/{WebUtility.HtmlEncode(p.Slug)}\">view</a>")}} <form method="post" action="/admin/page/delete/{{p.Id}}" style="display:inline;"><button type="submit">delete</button></form></li>"""));
 
     var postId = editingPost?.Id.ToString() ?? "";
     var postTitle = editingPost is null ? "" : WebUtility.HtmlEncode(editingPost.Title);
     var postSlug = editingPost is null ? "" : WebUtility.HtmlEncode(editingPost.Slug);
+    var postCategory = editingPost is null ? "default" : WebUtility.HtmlEncode(editingPost.Category);
     var postContent = editingPost is null ? "" : WebUtility.HtmlEncode(editingPost.Content);
-
     var pageId = editingPage?.Id.ToString() ?? "";
     var pageTitle = editingPage is null ? "" : WebUtility.HtmlEncode(editingPage.Title);
     var pageSlug = editingPage is null ? "" : WebUtility.HtmlEncode(editingPage.Slug);
+    var pageCategory = editingPage is null ? "default" : WebUtility.HtmlEncode(editingPage.Category);
     var pageContent = editingPage is null ? "" : WebUtility.HtmlEncode(editingPage.Content);
     var importBanner = importedCount is null ? "" : $$"""<p style="padding:.6rem;border:1px solid #bbf7d0;background:#f0fdf4;border-radius:8px;">CSV import completed: <strong>{{importedCount}}</strong> post(s) processed.</p>""";
 
@@ -503,7 +606,17 @@ static string RenderAdmin(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Admin</title>
   <style>
-    body { font-family: Segoe UI, Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1f2937; }
+    body {
+      font-family: Segoe UI, Arial, sans-serif;
+      margin: 0;
+      background-color: #c7e8e1;
+      background-image: url('/images/book-corner.png');
+      background-repeat: no-repeat;
+      background-position: right bottom;
+      background-attachment: fixed;
+      background-size: 420px auto;
+      color: #1f2937;
+    }
     main { max-width: 1100px; margin: 2rem auto; background: white; padding: 2rem; border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.08); }
     .menu { display: flex; gap: 0.8rem; flex-wrap: wrap; padding: 0.75rem; background: #f1f5f9; border-radius: 8px; margin-bottom: 1rem; }
     .menu a { color: #1d4ed8; text-decoration: none; font-weight: 600; }
@@ -522,42 +635,52 @@ static string RenderAdmin(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage>
 </head>
 <body>
   <main>
-    {{RenderMenuBar(posts, pages)}}
+    {{RenderMenuBar(pages, customNavItems, isAuthenticated, isAdmin, userEmail)}}
     <h1>Content Admin</h1>
     {{importBanner}}
+    <h2>Navigation Bar</h2>
+    <form method="post" action="/admin/settings/navigation">
+      <label>Custom links (one per line: Label|/path-or-url)</label>
+      <textarea name="navigationItems" style="min-height:120px;">{{WebUtility.HtmlEncode(navEditorText)}}</textarea>
+      <button type="submit">Save Navigation</button>
+    </form>
     {{RenderUploadPanel(uploadedPath)}}
-    {{RenderCsvImportPanel()}}
     <div class="grid">
       <section>
-        <h2>Posts</h2>
+        <h2>Post Editor</h2>
         <form method="post" action="/admin/save">
           <input type="hidden" name="id" value="{{postId}}" />
           <label>Title</label>
           <input name="title" required value="{{postTitle}}" />
           <label>Slug</label>
           <input name="slug" required value="{{postSlug}}" />
+          <label>Category</label>
+          <input name="category" required value="{{postCategory}}" />
           <label>Content (Markdown)</label>
           {{RenderToolbar("post-content")}}
           <textarea id="post-content" name="content" required>{{postContent}}</textarea>
           <button type="submit">{{(editingPost is null ? "Create post" : "Update post")}}</button>
         </form>
-        <h3>All posts</h3>
+        <h3>Posts</h3>
         <ul>{{postList}}</ul>
       </section>
       <section>
-        <h2>Pages</h2>
+        <h2>Page Manager</h2>
         <form method="post" action="/admin/page/save">
           <input type="hidden" name="id" value="{{pageId}}" />
           <label>Title</label>
           <input name="title" required value="{{pageTitle}}" />
           <label>Slug</label>
-          <input name="slug" required value="{{pageSlug}}" />
+          <input name="slug" value="{{pageSlug}}" />
+          <p><small>Leave empty to display this page directly on the home page.</small></p>
+          <label>Category</label>
+          <input name="category" required value="{{pageCategory}}" />
           <label>Content (Markdown)</label>
           {{RenderToolbar("page-content")}}
           <textarea id="page-content" name="content" required>{{pageContent}}</textarea>
           <button type="submit">{{(editingPage is null ? "Create page" : "Update page")}}</button>
         </form>
-        <h3>All pages</h3>
+        <h3>Pages</h3>
         <ul>{{pageList}}</ul>
       </section>
     </div>
@@ -624,18 +747,6 @@ static string RenderAdmin(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage>
 """;
 }
 
-static string RenderCsvImportPanel()
-{
-    return """
-<h2>Import posts from CSV</h2>
-<form method="post" action="/admin/import/posts-csv" enctype="multipart/form-data">
-  <input type="file" name="csvFile" accept=".csv,text/csv" required />
-  <button type="submit">Import CSV</button>
-</form>
-<p><small>Required headers: <code>title</code>, <code>content</code>. Optional: <code>slug</code>. Existing posts with same slug are updated.</small></p>
-""";
-}
-
 static string RenderToolbar(string targetId)
 {
     return $$"""
@@ -679,11 +790,18 @@ static string RenderUploadPanel(string uploadedPath)
 """;
 }
 
-static string RenderMenuBar(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages)
+static string RenderMenuBar(IReadOnlyList<SitePage> pages, IReadOnlyList<SiteSettingsStore.NavigationItem> customNavItems, bool isAuthenticated, bool isAdmin, string userEmail)
 {
-    var pageLinks = string.Join(" ", pages.Select(p => $"<a href=\"/page/{WebUtility.HtmlEncode(p.Slug)}\">{WebUtility.HtmlEncode(p.Title)}</a>"));
-    var postLinks = string.Join(" ", posts.Take(6).Select(p => $"<a href=\"/post/{WebUtility.HtmlEncode(p.Slug)}\">{WebUtility.HtmlEncode(p.Title)}</a>"));
-    return $$"""<nav class="menu"><a href="/">Home</a><a href="/contact">Contact</a>{{pageLinks}}{{postLinks}}</nav>""";
+    var pageLinks = string.Join(" ", pages
+        .Where(p => !string.IsNullOrWhiteSpace(p.Slug))
+        .Select(p => $"<a href=\"/page/{WebUtility.HtmlEncode(p.Slug)}\">{WebUtility.HtmlEncode(p.Title)}</a>"));
+    var customLinks = string.Join(" ", customNavItems.Select(x =>
+        $"<a href=\"{WebUtility.HtmlEncode(x.Url)}\">{WebUtility.HtmlEncode(x.Label)}</a>"));
+    var authLinks = isAuthenticated
+        ? $$"""<span style="color:#334155;">{{WebUtility.HtmlEncode(userEmail)}}</span>{{(isAdmin ? "<a href=\"/admin\">Add Post</a>" : "")}}<form method="post" action="/logout" style="display:inline;margin:0;"><button type="submit" style="font:inherit;padding:.25rem .6rem;cursor:pointer;">Sign out</button></form>"""
+        : "<a href=\"/login?returnUrl=/admin\">Sign in</a>";
+
+    return $$"""<nav class="menu"><a href="/">Home</a><a href="/contact">Contact</a>{{customLinks}}{{pageLinks}}{{authLinks}}</nav>""";
 }
 
 static string RenderMarkup(string raw)
@@ -707,7 +825,28 @@ static string Slugify(string value)
     return slug.Trim('-');
 }
 
-static string RenderContact(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePage> pages)
+static string NormalizeCategory(string? category)
+{
+    return string.IsNullOrWhiteSpace(category) ? "default" : category.Trim();
+}
+
+static string FormatCentralTime(DateTimeOffset utcTime)
+{
+    TimeZoneInfo timeZone;
+    try
+    {
+        timeZone = TimeZoneInfo.FindSystemTimeZoneById("America/Chicago");
+    }
+    catch (TimeZoneNotFoundException)
+    {
+        timeZone = TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time");
+    }
+
+    var local = TimeZoneInfo.ConvertTime(utcTime, timeZone);
+    return local.ToString("MMMM d, yyyy 'at' h:mm tt 'CT'");
+}
+
+static string RenderContact(IReadOnlyList<SitePage> pages, IReadOnlyList<SiteSettingsStore.NavigationItem> customNavItems, bool isAuthenticated, bool isAdmin, string userEmail)
 {
     return $$"""
 <!doctype html>
@@ -725,7 +864,7 @@ static string RenderContact(IReadOnlyList<BlogPost> posts, IReadOnlyList<SitePag
 </head>
 <body>
   <main>
-    {{RenderMenuBar(posts, pages)}}
+    {{RenderMenuBar(pages, customNavItems, isAuthenticated, isAdmin, userEmail)}}
     <h1>Contact</h1>
     <p>For feedback or corrections, contact the site owner.</p>
     <p>Email: <a href="mailto:contact@example.com">contact@example.com</a></p>
@@ -801,6 +940,53 @@ static string NormalizeReturnUrl(string returnUrl)
     }
 
     return returnUrl;
+}
+
+static string SerializeNavigationItemsForEditor(IReadOnlyList<SiteSettingsStore.NavigationItem> items)
+{
+    return string.Join(
+        Environment.NewLine,
+        items.Select(i => $"{i.Label}|{i.Url}"));
+}
+
+static List<SiteSettingsStore.NavigationItem> ParseNavigationItemsFromEditor(string text)
+{
+    var items = new List<SiteSettingsStore.NavigationItem>();
+    if (string.IsNullOrWhiteSpace(text))
+    {
+        return items;
+    }
+
+    var lines = text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n');
+    foreach (var raw in lines)
+    {
+        var line = raw.Trim();
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            continue;
+        }
+
+        var separator = line.IndexOf('|');
+        if (separator <= 0 || separator >= line.Length - 1)
+        {
+            continue;
+        }
+
+        var label = line[..separator].Trim();
+        var url = line[(separator + 1)..].Trim();
+        if (string.IsNullOrWhiteSpace(label) || string.IsNullOrWhiteSpace(url))
+        {
+            continue;
+        }
+
+        items.Add(new SiteSettingsStore.NavigationItem
+        {
+            Label = label,
+            Url = url
+        });
+    }
+
+    return items;
 }
 
 static string GetCsvValue(List<string> row, int index)

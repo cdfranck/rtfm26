@@ -52,6 +52,7 @@ public sealed class PageStore
         {
             var pages = LoadInternal();
             var existing = pages.FindIndex(x => x.Id == page.Id);
+            page.Category = NormalizeCategory(page.Category);
             page.UpdatedUtc = DateTimeOffset.UtcNow;
 
             if (existing >= 0)
@@ -96,12 +97,23 @@ public sealed class PageStore
             return [];
         }
 
-        return JsonSerializer.Deserialize<List<SitePage>>(json, JsonOptions) ?? [];
+        var pages = JsonSerializer.Deserialize<List<SitePage>>(json, JsonOptions) ?? [];
+        foreach (var page in pages)
+        {
+            page.Category = NormalizeCategory(page.Category);
+        }
+
+        return pages;
     }
 
     private void SaveInternal(List<SitePage> pages)
     {
         var json = JsonSerializer.Serialize(pages, JsonOptions);
         File.WriteAllText(_path, json);
+    }
+
+    private static string NormalizeCategory(string? category)
+    {
+        return string.IsNullOrWhiteSpace(category) ? "default" : category.Trim();
     }
 }

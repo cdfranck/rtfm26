@@ -1,39 +1,34 @@
-# Empty CMS template
+# rtfm26 blog
 
-## How to run
+Simple ASP.NET Core blog with web-based editing.
 
-Chose one of the following options to get started. 
+## Run locally
 
-### Windows
-
-Prerequisities
-- .NET SDK 5+
-- SQL Server 2016 Express LocalDB (or later)
+- .NET SDK 10
 
 ```bash
-$ dotnet run
-````
+dotnet restore
+dotnet run
+```
 
-### Any OS with Docker
+## Routes
 
-Prerequisities
-- Docker
-- Enable Docker support when applying the template
+- `/` list blog posts
+- `/post/{slug}` view a post
+- `/admin` create/delete posts in the browser
+- `/health` health check endpoint
 
-```bash
-$ docker-compose up
-````
+## Content storage
 
-> Note that this Docker setup is just configured for local development. Follow this [guide to enable HTTPS](https://github.com/dotnet/dotnet-docker/blob/main/samples/run-aspnetcore-https-development.md).
+Posts are saved to `App_Data/posts.json`.
 
-### Any OS with external database server
-
-Prerequisities
-- .NET SDK 5+
-- SQL Server 2016 (or later) on a external server, e.g. Azure SQL
-
-Create an empty database on the external database server and update the connection string accordingly.
+## Deploy to Azure App Service
 
 ```bash
-$ dotnet run
-````
+az group create --name rtfm26-rg --location eastus
+az appservice plan create --name rtfm26-plan --resource-group rtfm26-rg --sku B1 --is-linux
+az webapp create --name <unique-app-name> --resource-group rtfm26-rg --plan rtfm26-plan --runtime "DOTNETCORE|10.0"
+dotnet publish -c Release -o ./publish
+Compress-Archive -Path ./publish/* -DestinationPath ./publish.zip -Force
+az webapp deploy --resource-group rtfm26-rg --name <unique-app-name> --src-path ./publish.zip --type zip
+```

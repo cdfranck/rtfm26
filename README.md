@@ -1,6 +1,18 @@
 # rtfm26 blog
 
-Simple ASP.NET Core blog with web-based editing.
+Custom ASP.NET Core (`.NET 10`) blog/CMS-lite with:
+- Microsoft account login for admin
+- Post and page management in `/admin`
+- Markdown content support
+- Drag-and-drop uploads with inline insert tools
+- Header menu with page/post navigation
+
+## Documentation
+
+- [Getting Started](./README.md)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Operations Guide](./docs/OPERATIONS.md)
+- [Azure Deployment](./docs/AZURE_DEPLOY.md)
 
 ## Run locally
 
@@ -13,14 +25,24 @@ dotnet run
 
 ## Routes
 
-- `/` list blog posts
+- `/` landing page + post list + navigation menu
 - `/post/{slug}` view a post
-- `/admin` create/delete posts in the browser
+- `/page/{slug}` view a page
+- `/admin` manage posts/pages and uploads (Microsoft login required)
+- `/login` Microsoft sign-in page
+- `/contact` contact page
 - `/health` health check endpoint
 
 ## Content storage
 
-Posts are saved to `App_Data/posts.json`.
+Stored on local disk:
+- Posts: `App_Data/posts.json`
+- Pages: `App_Data/pages.json`
+- Uploads: `App_Data/uploads/*`
+
+Important:
+- `/admin` requires Microsoft sign-in and only `Admin:AllowedEmail` has edit rights.
+- Local file storage is fine for single-instance use but not ideal for scaled Azure setups.
 
 ## Deploy to Azure App Service
 
